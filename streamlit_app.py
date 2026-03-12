@@ -5,10 +5,12 @@ import plotly.graph_objects as go
 from pytrends.request import TrendReq
 from datetime import datetime, date
 import time
+import random
 
 # ── ページ設定 ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Google Trends Japan Analyzer",
+    page_icon="🗾",
     layout="wide",
 )
 
@@ -123,7 +125,7 @@ html, body, [class*="css"] {
 # ── ヘッダー ────────────────────────────────────────────────
 st.markdown("""
 <div class="main-header">
-    <h1>Google Trends Japan Analyzer</h1>
+    <h1>🗾 Google Trends Japan Analyzer</h1>
     <p>日本市場向け・都道府県別インサイトを含むトレンド分析ツール</p>
 </div>
 """, unsafe_allow_html=True)
@@ -140,14 +142,14 @@ with st.container():
         )
     with col2:
         start_date = st.date_input(
-            "開始日 (Start Date)",
+            "📅 開始日 (Start Date)",
             value=date(2026, 1, 1),
             min_value=date(2024, 1, 1),
             max_value=date.today(),
         )
     with col3:
         end_date = st.date_input(
-            "終了日 (End Date)",
+            "📅 終了日 (End Date)",
             value=date.today(),
             min_value=date(2024, 1, 2),
             max_value=date.today(),
@@ -168,34 +170,85 @@ if run:
     timeframe = f"{start_date.strftime('%Y-%m-%d')} {end_date.strftime('%Y-%m-%d')}"
 
     # ── データ取得 ──────────────────────────────────────────
-    with st.spinner("Google Trendsからデータを取得中... 少々お待ちください"):
+    # ── Google 429対策: ブラウザに偽装したヘッダー ──────────────
+    REQUESTS_ARGS = {
+        'headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/122.0.0.0 Safari/537.36'
+            ),
+            'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Referer': 'https://trends.google.co.jp/',
+        }
+    }
+
+    def build_pytrends():
+        # urllib3 v2.x では retries/backoff_factor が非対応のため除外
+        return TrendReq(
+            hl='ja-JP',
+            tz=-540,
+            timeout=(10, 30),
+            requests_args=REQUESTS_ARGS,
+        )
+
+    def fetch_with_retry(fn, label, max_retries=3):
+        """429が来たら指数バックオフで自動リトライ"""
+        for attempt in range(max_retries):
+            try:
+                return fn()
+            except Exception as e:
+                if '429' in str(e) and attempt < max_retries - 1:
+                    wait = (2 ** attempt) * 5 + random.uniform(1, 3)  # 5s, 12s, 25s...
+                    st.warning(f"⏳ {label}: レート制限 (429)。{wait:.0f}秒後にリトライ… ({attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    raise e
+
+    with st.spinner("Google Trendsからデータを取得中... 少々お待ちください 🔄"):
         try:
-            pytrends = TrendReq(hl='ja-JP', tz=-540)
-            pytrends.build_payload(
-                kw_list=[keyword],
-                cat=0,
-                timeframe=timeframe,
-                geo='JP',      # 日本限定
-                gprop=''
-            )
+            pytrends = build_pytrends()
 
             # 1) 時系列データ
-            iot = pytrends.interest_over_time()
+            def fetch_iot():
+                pytrends.build_payload(
+                    kw_list=[keyword],
+                    cat=0,
+                    timeframe=timeframe,
+                    geo='JP',
+                    gprop=''
+                )
+                return pytrends.interest_over_time()
 
-            # 2) 都道府県別データ（少しウェイト）
-            time.sleep(1)
-            geo_data = pytrends.interest_by_region(
-                resolution='REGION',   # 都道府県レベル
-                inc_low_vol=True,
-                inc_geo_code=False
-            )
+            iot = fetch_with_retry(fetch_iot, "時系列データ")
+
+            # 2) 都道府県別データ
+            time.sleep(random.uniform(2, 4))  # ランダムウェイトで人間らしく
+            def fetch_geo():
+                return pytrends.interest_by_region(
+                    resolution='REGION',
+                    inc_low_vol=True,
+                    inc_geo_code=False
+                )
+            geo_data = fetch_with_retry(fetch_geo, "都道府県データ")
 
             # 3) 関連クエリ
-            time.sleep(1)
-            related = pytrends.related_queries()
+            time.sleep(random.uniform(2, 4))
+            related = fetch_with_retry(pytrends.related_queries, "関連クエリ")
 
         except Exception as e:
-            st.error(f"❌ データ取得エラー: {e}\n\nしばらく時間をおいてから再試行してください（レート制限の可能性があります）。")
+            err_msg = str(e)
+            if '429' in err_msg:
+                st.error(
+                    "❌ **Google レート制限 (429)**\n\n"
+                    "Streamlit Cloud の共有IPがGoogleにブロックされています。\n\n"
+                    "**対処法:**\n"
+                    "- 数分待ってから再試行してください\n"
+                    "- ローカル環境で実行すると安定します: `streamlit run trends_jp.py`"
+                )
+            else:
+                st.error(f"❌ データ取得エラー: {err_msg}")
             st.stop()
 
     if iot.empty:
@@ -212,14 +265,14 @@ if run:
     min_val = int(iot[keyword].min())
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("平均関心度", avg_val, help="期間中の平均スコア（0〜100）")
-    c2.metric("最高スコア", max_val)
-    c3.metric("ピーク日", max_date)
-    c4.metric("最低スコア", min_val)
+    c1.metric("📊 平均関心度", avg_val, help="期間中の平均スコア（0〜100）")
+    c2.metric("🔝 最高スコア", max_val)
+    c3.metric("📅 ピーク日", max_date)
+    c4.metric("📉 最低スコア", min_val)
 
     # ── ① 時系列チャート ───────────────────────────────────
     st.markdown("---")
-    st.markdown('<div class="section-title">時系列トレンド（日本）</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">📈 時系列トレンド（日本）</div>', unsafe_allow_html=True)
 
     fig_line = go.Figure()
     fig_line.add_trace(go.Scatter(
@@ -246,7 +299,7 @@ if run:
 
     # ── ② 都道府県別 ───────────────────────────────────────
     st.markdown("---")
-    st.markdown('<div class="section-title">都道府県別 関心度</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🗺️ 都道府県別 関心度</div>', unsafe_allow_html=True)
 
     if geo_data.empty or geo_data[keyword].sum() == 0:
         st.info("都道府県別データは取得できませんでした（データ量が少ない可能性があります）。")
@@ -255,7 +308,7 @@ if run:
         geo_sorted = geo_sorted[geo_sorted[keyword] > 0].reset_index()
         geo_sorted.columns = ['都道府県', '関心度']
 
-        tab1, tab2 = st.tabs(["横棒グラフ", "ランキング表"])
+        tab1, tab2 = st.tabs(["📊 横棒グラフ", "🏆 ランキング表"])
 
         with tab1:
             fig_bar = px.bar(
@@ -311,7 +364,7 @@ if run:
 
     # ── ③ 関連クエリ ──────────────────────────────────────
     st.markdown("---")
-    st.markdown('<div class="section-title">関連クエリ</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔗 関連クエリ</div>', unsafe_allow_html=True)
 
     col_top, col_rise = st.columns(2)
 
@@ -335,7 +388,7 @@ if run:
         """, unsafe_allow_html=True)
 
     with col_top:
-        st.markdown("**トップ関連クエリ**")
+        st.markdown("**📌 トップ関連クエリ**")
         top_df = related.get(keyword, {}).get('top')
         render_query_table(
             top_df.reset_index(drop=True) if top_df is not None else None,
@@ -344,7 +397,7 @@ if run:
         )
 
     with col_rise:
-        st.markdown("**急上昇クエリ**")
+        st.markdown("**🚀 急上昇クエリ**")
         rise_df = related.get(keyword, {}).get('rising')
         def rise_badge(v):
             if str(v).lower() == 'breakout':
@@ -359,15 +412,14 @@ if run:
     # ── フッター ──────────────────────────────────────────
     st.markdown("---")
     st.markdown(
-        f"<div style='text-align:center;color:#aaa;font-size:0.78rem'>データソース: Google Trends (日本 / geo=JP, hl=ja-JP) ・ 期間: {timeframe}</div>",
+        f"<div style='text-align:center;color:#aaa;font-size:0.78rem'>📡 データソース: Google Trends (日本 / geo=JP, hl=ja-JP) ・ 期間: {timeframe}</div>",
         unsafe_allow_html=True
     )
 
 else:
     st.markdown("""
     <div class="info-box">
-        キーワードと期間を入力して「分析する」ボタンをクリックしてください。
+        💡 キーワードと期間を入力して「分析する」ボタンをクリックしてください。
         （例: キーワード = <b>韓国旅行</b>、期間 = 2025-01-01 〜 2025-12-31）
     </div>
     """, unsafe_allow_html=True)
-
